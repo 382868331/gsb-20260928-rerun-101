@@ -32,9 +32,10 @@ type Event struct {
 // Record is one immutable, hash-linked event. Seq values begin at one and
 // preserve the order supplied by the calling project.
 type Record struct {
-	Seq        uint64 `json:"seq"`
-	Event      Event  `json:"event"`
-	RecordHash []byte `json:"record_hash"`
+	Seq          uint64 `json:"seq"`
+	PreviousHash []byte `json:"previous_hash"`
+	Event        Event  `json:"event"`
+	RecordHash   []byte `json:"record_hash"`
 }
 
 type frameHeader struct {
@@ -70,7 +71,7 @@ type Store struct {
 	path    string
 	file    *os.File
 	records []Record
-	last    []byte
+	sources map[string][]Record
 }
 
 // Open opens an audit log and removes only an incomplete frame at the physical
@@ -82,7 +83,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{path: path, file: f}
+	s := &Store{path: path, file: f, sources: make(map[string][]Record)}
 	if err := s.recoverTail(); err != nil {
 		f.Close()
 		return nil, err
@@ -121,9 +122,18 @@ func (s *Store) AppendBatch(events []Event) ([]Record, error) {
 
 	appended := make([]Record, 0, len(events))
 	for _, event := range events {
-		seq := uint64(len(s.records) + 1)
-		recordHash := hashRecord(seq, s.last, event)
-		frame, err := encodeFrame(seq, s.last, event, recordHash)
+		normalized := normalizeEvent(event)
+		if normalized.Source == "" {
+			return nil, fmt.Errorf("audit event source is required")
+		}
+		sourceRecords := s.sources[normalized.Source]
+		seq := uint64(len(sourceRecords) + 1)
+		var previous []byte
+		if len(sourceRecords) > 0 {
+			previous = sourceRecords[len(sourceRecords)-1].RecordHash
+		}
+		recordHash := hashRecord(seq, previous, normalized)
+		frame, err := encodeFrame(seq, previous, normalized, recordHash)
 		if err != nil {
 			return nil, err
 		}
@@ -134,9 +144,9 @@ func (s *Store) AppendBatch(events []Event) ([]Record, error) {
 			return nil, err
 		}
 
-		record := Record{Seq: seq, Event: event, RecordHash: recordHash}
+		record := Record{Seq: seq, PreviousHash: append([]byte(nil), previous...), Event: normalized, RecordHash: recordHash}
 		s.records = append(s.records, record)
-		s.last = recordHash
+		s.sources[normalized.Source] = append(sourceRecords, record)
 		appended = append(appended, record)
 	}
 	return appended, nil
@@ -150,18 +160,37 @@ func (s *Store) Query() []Record {
 	return out
 }
 
+// QuerySource returns records for one source in that source's sequence.
+func (s *Store) QuerySource(source string) []Record {
+	records := s.sources[source]
+	out := make([]Record, len(records))
+	copy(out, records)
+	return out
+}
+
+// BuildRangeProof produces a proof for one source and inclusive sequence range.
+// No records from other sources or outside the requested range are included.
+func (s *Store) BuildRangeProof(source string, startSeq, endSeq uint64) (*RangeProof, error) {
+	return buildRangeProof(s.sources[source], source, startSeq, endSeq)
+}
+
 // Seal seals the complete log at its current length. The application must store
 // the returned summary outside the audited file.
 func (s *Store) Seal(source string) (*SealSummary, error) {
-	if len(s.records) == 0 {
+	records := s.sources[source]
+	if len(records) == 0 {
 		return nil, ErrNoRecord
+	}
+	recordHashes := make([][]byte, len(records))
+	for i := range records {
+		recordHashes[i] = records[i].RecordHash
 	}
 	summary := SealSummary{
 		Version:     1,
-		SealedAt:    time.Now().UTC(),
 		Source:      source,
-		RecordCount: uint64(len(s.records)),
-		LastHash:    append([]byte(nil), s.last...),
+		RecordCount: uint64(len(records)),
+		LastHash:    append([]byte(nil), records[len(records)-1].RecordHash...),
+		MerkleRoot:  merkleRoot(recordHashes),
 	}
 	return &summary, nil
 }
@@ -225,12 +254,12 @@ func (s *Store) load() error {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	records, last, err := readRecords(s.file)
+	records, sources, err := readRecords(s.file)
 	if err != nil {
 		return err
 	}
 	s.records = records
-	s.last = last
+	s.sources = sources
 	_, err = s.file.Seek(0, io.SeekEnd)
 	return err
 }
@@ -262,50 +291,14 @@ func encodeFrame(seq uint64, previous []byte, event Event, recordHash []byte) ([
 	return frame, nil
 }
 
-func scanValidPrefix(r io.ReaderAt) (int64, error) {
-	var offset int64
-	headerBytes := make([]byte, frameHeaderLength)
-	for {
-		if _, err := r.ReadAt(headerBytes, offset); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return offset, nil
-			}
-			return 0, err
-		}
-		var header frameHeader
-		if err := binary.Read(bytes.NewReader(headerBytes), binary.BigEndian, &header); err != nil {
-			return 0, err
-		}
-		if header.Magic != frameMagic {
-			return offset, nil
-		}
-
-		frameEnd := offset + frameHeaderLength + int64(header.Length) + hashLength
-		frame := make([]byte, frameHeaderLength+int64(header.Length)+hashLength)
-		n, err := r.ReadAt(frame, offset)
-		if err != nil && !(errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)) {
-			return 0, err
-		}
-		if int64(n) < frameEnd-offset {
-			return offset, nil
-		}
-		payload := frame[frameHeaderLength : frameHeaderLength+int64(header.Length)]
-		storedDigest := frame[frameHeaderLength+int64(header.Length) : frameEnd-offset]
-		if !bytes.Equal(sha256Hash(payload), storedDigest) {
-			return offset, nil
-		}
-		offset = frameEnd
-	}
-}
-
-func readRecords(r io.Reader) ([]Record, []byte, error) {
+func readRecords(r io.Reader) ([]Record, map[string][]Record, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var records []Record
-	var previous []byte
+	grouped := make(map[string][]Record)
 	offset := 0
 	for offset < len(data) {
 		if len(data[offset:]) < frameHeaderLength {
@@ -333,25 +326,33 @@ func readRecords(r io.Reader) ([]Record, []byte, error) {
 			return nil, nil, fmt.Errorf("invalid audit frame payload at byte %d: %w", offset, err)
 		}
 		expectedHash := hashRecord(env.Seq, env.Previous, env.Event)
-		if env.Seq != uint64(len(records)+1) {
-			return nil, nil, fmt.Errorf("expected record %d, found %d at byte %d", len(records)+1, env.Seq, offset)
+		event := normalizeEvent(env.Event)
+		sourceRecords := grouped[event.Source]
+		if env.Seq != uint64(len(sourceRecords)+1) {
+			return nil, nil, fmt.Errorf("source %q expected record %d, found %d at byte %d", event.Source, len(sourceRecords)+1, env.Seq, offset)
 		}
-		if !bytes.Equal(env.Previous, previous) {
-			return nil, nil, fmt.Errorf("record %d has an invalid previous hash", env.Seq)
+		var expectedPrevious []byte
+		if len(sourceRecords) > 0 {
+			expectedPrevious = sourceRecords[len(sourceRecords)-1].RecordHash
+		}
+		if !bytes.Equal(env.Previous, expectedPrevious) {
+			return nil, nil, fmt.Errorf("source %q record %d has an invalid previous hash", event.Source, env.Seq)
 		}
 		if !bytes.Equal(env.RecordHash, expectedHash) {
 			return nil, nil, fmt.Errorf("record %d hash mismatch", env.Seq)
 		}
 
-		records = append(records, Record{
-			Seq:        env.Seq,
-			Event:      normalizeEvent(env.Event),
-			RecordHash: append([]byte(nil), env.RecordHash...),
-		})
-		previous = expectedHash
+		record := Record{
+			Seq:          env.Seq,
+			PreviousHash: append([]byte(nil), env.Previous...),
+			Event:        normalizeEvent(env.Event),
+			RecordHash:   append([]byte(nil), env.RecordHash...),
+		}
+		records = append(records, record)
+		grouped[event.Source] = append(grouped[event.Source], record)
 		offset = end
 	}
-	return records, previous, nil
+	return records, grouped, nil
 }
 
 func normalizeEvent(event Event) Event {

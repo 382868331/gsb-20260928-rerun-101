@@ -93,7 +93,7 @@ func TestSealDetectsRewrittenCopyByContentHash(t *testing.T) {
 	if _, err := store.AppendBatch(events); err != nil {
 		t.Fatal(err)
 	}
-	seal, err := store.Seal("batch-1")
+	seal, err := store.Seal("project-x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestSealDetectsMiddleDeletionAndNotByCountAlone(t *testing.T) {
 	if _, err := store.AppendBatch(testEvents(4)); err != nil {
 		t.Fatal(err)
 	}
-	seal, err := store.Seal("batch-1")
+	seal, err := store.Seal("project-x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestSealDetectsTailTruncationUsingExternalSummary(t *testing.T) {
 	if _, err := store.AppendBatch(testEvents(4)); err != nil {
 		t.Fatal(err)
 	}
-	seal, err := store.Seal("batch-1")
+	seal, err := store.Seal("project-x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestSealDetectsInsertionAfterSealedPrefix(t *testing.T) {
 	if _, err := store.AppendBatch(testEvents(4)); err != nil {
 		t.Fatal(err)
 	}
-	seal, err := store.Seal("batch-1")
+	seal, err := store.Seal("project-x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestValidCopyPassesSealVerification(t *testing.T) {
 	if _, err := store.AppendBatch(testEvents(3)); err != nil {
 		t.Fatal(err)
 	}
-	seal, err := store.Seal("batch-1")
+	seal, err := store.Seal("project-x")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func testEvents(n int) []Event {
 	for i := range events {
 		events[i] = Event{
 			ID:         "event-" + string(rune('1'+i)),
-			Source:     []string{"build", "review", "release", "policy"}[i%4],
+			Source:     "project-x",
 			Type:       "project.generated",
 			OccurredAt: base.Add(time.Duration(i) * time.Minute),
 			Payload:    []byte{byte(i + 1), byte(i + 2), byte(i + 3)},
