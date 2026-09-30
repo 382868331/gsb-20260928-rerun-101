@@ -11,10 +11,13 @@ import (
 type TamperKind string
 
 const (
-	TamperRewrite        TamperKind = "rewrite"
-	TamperInsertion      TamperKind = "insertion"
-	TamperMiddleDeletion TamperKind = "middle_deletion"
-	TamperTailTruncation TamperKind = "tail_truncation"
+	TamperRewrite            TamperKind = "rewrite"
+	TamperInsertion          TamperKind = "insertion"
+	TamperMiddleDeletion     TamperKind = "middle_deletion"
+	TamperTailTruncation     TamperKind = "tail_truncation"
+	TamperMissingRange       TamperKind = "missing_range"
+	TamperWrongSource        TamperKind = "wrong_source"
+	TamperSegmentReplacement TamperKind = "segment_replacement"
 )
 
 type TamperError struct {
@@ -38,7 +41,8 @@ func readRecordsForVerification(r io.Reader) ([]Record, []byte, error) {
 	}
 
 	var records []Record
-	var previous []byte
+	previousBySource := make(map[string][]byte)
+	countBySource := make(map[string]uint64)
 	offset := 0
 	for offset < len(data) {
 		_, payload, storedDigest, next, err := readFrame(data, offset)
@@ -53,8 +57,12 @@ func readRecordsForVerification(r io.Reader) ([]Record, []byte, error) {
 		if err := json.Unmarshal(payload, &env); err != nil {
 			return nil, nil, &TamperError{Kind: TamperRewrite, RecordSeq: 0, ByteOffset: int64(offset), Message: err.Error()}
 		}
-		expectedSeq := uint64(len(records) + 1)
-		expectedHash := hashRecord(env.Seq, env.Previous, env.Event)
+		if env.Version != 2 || env.Source == "" || env.Source != env.Event.Source {
+			return nil, nil, &TamperError{Kind: TamperWrongSource, RecordSeq: env.Seq, ByteOffset: int64(offset), Message: "record source metadata mismatch"}
+		}
+		previous := previousBySource[env.Source]
+		expectedSeq := countBySource[env.Source] + 1
+		expectedHash := hashRecord(env.Seq, env.Previous, normalizeEvent(env.Event))
 		switch {
 		case env.Seq > expectedSeq:
 			return nil, nil, &TamperError{Kind: TamperMiddleDeletion, RecordSeq: expectedSeq, ByteOffset: int64(offset), Message: "sequence number gap from a removed middle record"}
@@ -67,10 +75,11 @@ func readRecordsForVerification(r io.Reader) ([]Record, []byte, error) {
 		}
 
 		records = append(records, Record{Seq: env.Seq, Event: env.Event, RecordHash: append([]byte(nil), env.RecordHash...)})
-		previous = env.RecordHash
+		previousBySource[env.Source] = env.RecordHash
+		countBySource[env.Source]++
 		offset = next
 	}
-	return records, previous, nil
+	return records, nil, nil
 }
 
 func readFrame(data []byte, offset int) (frameHeader, []byte, []byte, int, error) {

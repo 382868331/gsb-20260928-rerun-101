@@ -13,7 +13,8 @@ func sha256Hash(data []byte) []byte {
 func hashRecord(seq uint64, previous []byte, event Event) []byte {
 	event = normalizeEvent(event)
 	canonical := canonicalRecord{
-		Version:  1,
+		Version:  2,
+		Source:   event.Source,
 		Seq:      seq,
 		Previous: previous,
 		Event: canonicalEvent{

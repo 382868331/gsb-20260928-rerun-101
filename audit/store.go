@@ -44,6 +44,7 @@ type frameHeader struct {
 
 type envelope struct {
 	Version    uint64 `json:"version"`
+	Source     string `json:"source"`
 	Seq        uint64 `json:"seq"`
 	Previous   []byte `json:"previous_hash"`
 	Event      Event  `json:"event"`
@@ -60,9 +61,15 @@ type canonicalEvent struct {
 
 type canonicalRecord struct {
 	Version  uint64         `json:"version"`
+	Source   string         `json:"source"`
 	Seq      uint64         `json:"seq"`
 	Previous []byte         `json:"previous_hash"`
 	Event    canonicalEvent `json:"event"`
+}
+
+type sourceState struct {
+	records []Record
+	last    []byte
 }
 
 // Store is an append-only audit log. Its zero value is not usable; use Open.
@@ -70,7 +77,7 @@ type Store struct {
 	path    string
 	file    *os.File
 	records []Record
-	last    []byte
+	sources map[string]*sourceState
 }
 
 // Open opens an audit log and removes only an incomplete frame at the physical
@@ -82,7 +89,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	s := &Store{path: path, file: f}
+	s := &Store{path: path, file: f, sources: make(map[string]*sourceState)}
 	if err := s.recoverTail(); err != nil {
 		f.Close()
 		return nil, err
@@ -121,9 +128,18 @@ func (s *Store) AppendBatch(events []Event) ([]Record, error) {
 
 	appended := make([]Record, 0, len(events))
 	for _, event := range events {
-		seq := uint64(len(s.records) + 1)
-		recordHash := hashRecord(seq, s.last, event)
-		frame, err := encodeFrame(seq, s.last, event, recordHash)
+		event = normalizeEvent(event)
+		if event.Source == "" {
+			return nil, errors.New("audit event source is required")
+		}
+		state := s.sources[event.Source]
+		if state == nil {
+			state = &sourceState{}
+			s.sources[event.Source] = state
+		}
+		seq := uint64(len(state.records) + 1)
+		recordHash := hashRecord(seq, state.last, event)
+		frame, err := encodeFrame(seq, state.last, event, recordHash)
 		if err != nil {
 			return nil, err
 		}
@@ -136,7 +152,8 @@ func (s *Store) AppendBatch(events []Event) ([]Record, error) {
 
 		record := Record{Seq: seq, Event: event, RecordHash: recordHash}
 		s.records = append(s.records, record)
-		s.last = recordHash
+		state.records = append(state.records, record)
+		state.last = recordHash
 		appended = append(appended, record)
 	}
 	return appended, nil
@@ -150,18 +167,36 @@ func (s *Store) Query() []Record {
 	return out
 }
 
-// Seal seals the complete log at its current length. The application must store
-// the returned summary outside the audited file.
+// QuerySource returns one source's independently numbered chain. Events from
+// other sources are not included and do not affect these sequence numbers.
+func (s *Store) QuerySource(source string) []Record {
+	state := s.sources[source]
+	if state == nil {
+		return nil
+	}
+	out := make([]Record, len(state.records))
+	copy(out, state.records)
+	return out
+}
+
+// Seal seals one source's complete segment at its current length. The
+// application must store the returned summary outside the audited file.
 func (s *Store) Seal(source string) (*SealSummary, error) {
-	if len(s.records) == 0 {
+	state := s.sources[source]
+	if state == nil || len(state.records) == 0 {
 		return nil, ErrNoRecord
 	}
+	leaves := make([][]byte, len(state.records))
+	for i, record := range state.records {
+		leaves[i] = append([]byte(nil), record.RecordHash...)
+	}
 	summary := SealSummary{
-		Version:     1,
+		Version:     2,
 		SealedAt:    time.Now().UTC(),
 		Source:      source,
-		RecordCount: uint64(len(s.records)),
-		LastHash:    append([]byte(nil), s.last...),
+		RecordCount: uint64(len(state.records)),
+		LastHash:    append([]byte(nil), state.last...),
+		MerkleRoot:  merkleRoot(leaves),
 	}
 	return &summary, nil
 }
@@ -225,19 +260,29 @@ func (s *Store) load() error {
 	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	records, last, err := readRecords(s.file)
+	records, _, err := readRecords(s.file)
 	if err != nil {
 		return err
 	}
 	s.records = records
-	s.last = last
+	s.sources = make(map[string]*sourceState)
+	for _, record := range records {
+		state := s.sources[record.Event.Source]
+		if state == nil {
+			state = &sourceState{}
+			s.sources[record.Event.Source] = state
+		}
+		state.records = append(state.records, record)
+		state.last = record.RecordHash
+	}
 	_, err = s.file.Seek(0, io.SeekEnd)
 	return err
 }
 
 func encodeFrame(seq uint64, previous []byte, event Event, recordHash []byte) ([]byte, error) {
 	payload, err := json.Marshal(envelope{
-		Version:    1,
+		Version:    2,
+		Source:     event.Source,
 		Seq:        seq,
 		Previous:   previous,
 		Event:      normalizeEvent(event),
@@ -305,7 +350,8 @@ func readRecords(r io.Reader) ([]Record, []byte, error) {
 	}
 
 	var records []Record
-	var previous []byte
+	previousBySource := make(map[string][]byte)
+	countBySource := make(map[string]uint64)
 	offset := 0
 	for offset < len(data) {
 		if len(data[offset:]) < frameHeaderLength {
@@ -332,9 +378,14 @@ func readRecords(r io.Reader) ([]Record, []byte, error) {
 		if err := json.Unmarshal(payload, &env); err != nil {
 			return nil, nil, fmt.Errorf("invalid audit frame payload at byte %d: %w", offset, err)
 		}
-		expectedHash := hashRecord(env.Seq, env.Previous, env.Event)
-		if env.Seq != uint64(len(records)+1) {
-			return nil, nil, fmt.Errorf("expected record %d, found %d at byte %d", len(records)+1, env.Seq, offset)
+		if env.Version != 2 || env.Source == "" || env.Source != env.Event.Source {
+			return nil, nil, fmt.Errorf("invalid audit record source metadata at byte %d", offset)
+		}
+		previous := previousBySource[env.Source]
+		expectedSeq := countBySource[env.Source] + 1
+		expectedHash := hashRecord(env.Seq, env.Previous, normalizeEvent(env.Event))
+		if env.Seq != expectedSeq {
+			return nil, nil, fmt.Errorf("source %q expected record %d, found %d at byte %d", env.Source, expectedSeq, env.Seq, offset)
 		}
 		if !bytes.Equal(env.Previous, previous) {
 			return nil, nil, fmt.Errorf("record %d has an invalid previous hash", env.Seq)
@@ -348,10 +399,11 @@ func readRecords(r io.Reader) ([]Record, []byte, error) {
 			Event:      normalizeEvent(env.Event),
 			RecordHash: append([]byte(nil), env.RecordHash...),
 		})
-		previous = expectedHash
+		previousBySource[env.Source] = expectedHash
+		countBySource[env.Source]++
 		offset = end
 	}
-	return records, previous, nil
+	return records, nil, nil
 }
 
 func normalizeEvent(event Event) Event {
