@@ -490,3 +490,148 @@ func testEvents(n int) []Event {
 func newEvent(id, source string) Event {
 	return Event{ID: id, Source: source, Type: "project.generated", OccurredAt: time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC), Payload: []byte(id)}
 }
+
+func TestSealedRangeProofStaysValidAfterLaterAppends(t *testing.T) {
+	store := openTestStore(t)
+	if _, err := store.AppendBatch([]Event{newEvent("a-1", "alpha"), newEvent("a-2", "alpha"), newEvent("a-3", "alpha")}); err != nil {
+		t.Fatal(err)
+	}
+	oldSeal, err := store.Seal("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldProof, err := store.BuildSealedRangeProof(*oldSeal, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.AppendBatch([]Event{newEvent("a-4", "alpha"), newEvent("a-5", "alpha")}); err != nil {
+		t.Fatal(err)
+	}
+	newSeal, err := store.Seal("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := VerifyRangeProof(*oldSeal, *oldProof); err != nil {
+		t.Fatalf("proof built before the appends must still verify against the old summary: %v", err)
+	}
+	rebuilt, err := store.BuildSealedRangeProof(*oldSeal, 2, 3)
+	if err != nil {
+		t.Fatalf("old summary must remain provable after later appends: %v", err)
+	}
+	if rebuilt.SealedCount != oldSeal.RecordCount {
+		t.Fatalf("rebuilt proof anchors to %d records, want the old seal count %d", rebuilt.SealedCount, oldSeal.RecordCount)
+	}
+	if err := VerifyRangeProof(*oldSeal, *rebuilt); err != nil {
+		t.Fatalf("rebuilt proof must verify against the old summary: %v", err)
+	}
+	if err := VerifyRangeProof(*newSeal, *rebuilt); err == nil {
+		t.Fatal("old-seal proof must not verify against the new summary")
+	}
+	if _, err := store.BuildSealedRangeProof(*oldSeal, 1, 4); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("range beyond the old seal must be refused, got %v", err)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifySealedFile(store.path, *oldSeal); err == nil {
+		t.Fatal("new appends must not let the file pass under the old summary")
+	} else {
+		assertTamper(t, err, TamperInsertion, 4)
+	}
+}
+
+func TestSealedRangeProofRejectsReplacedPrefix(t *testing.T) {
+	store := openTestStore(t)
+	if _, err := store.AppendBatch([]Event{newEvent("a-1", "alpha"), newEvent("a-2", "alpha")}); err != nil {
+		t.Fatal(err)
+	}
+	seal, err := store.Seal("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := openTestStore(t)
+	if _, err := replacement.AppendBatch([]Event{newEvent("fake-1", "alpha"), newEvent("fake-2", "alpha")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replacement.BuildSealedRangeProof(*seal, 1, 2); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("replaced segment must not produce proofs for the old summary, got %v", err)
+	}
+}
+
+func TestCombinedRangeProofVerifiesIndependentSourcesWithoutGlobalOrder(t *testing.T) {
+	store := openTestStore(t)
+	base := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	late := Event{ID: "a-1", Source: "alpha", Type: "project.generated", OccurredAt: base.Add(2 * time.Hour), Payload: []byte("a-1")}
+	early := Event{ID: "b-1", Source: "beta", Type: "project.generated", OccurredAt: base, Payload: []byte("b-1")}
+	if _, err := store.AppendBatch([]Event{
+		late, early,
+		{ID: "a-2", Source: "alpha", Type: "project.generated", OccurredAt: base.Add(3 * time.Hour), Payload: []byte("a-2")},
+		{ID: "b-2", Source: "beta", Type: "project.generated", OccurredAt: base.Add(-time.Hour), Payload: []byte("b-2")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	alphaSeal, err := store.Seal("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	betaSeal, err := store.Seal("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaries := []SealSummary{*alphaSeal, *betaSeal}
+	requests := []SourceRangeRequest{
+		{Source: "alpha", StartSeq: 1, EndSeq: 2},
+		{Source: "beta", StartSeq: 2, EndSeq: 2},
+	}
+	combined, err := store.BuildCombinedRangeProof(summaries, requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined.Ranges) != 2 {
+		t.Fatalf("combined proof has %d ranges, want 2", len(combined.Ranges))
+	}
+	if err := VerifyCombinedRangeProof(summaries, *combined); err != nil {
+		t.Fatalf("valid combined proof failed: %v", err)
+	}
+
+	tampered := *combined
+	tampered.Ranges = append([]RangeProof(nil), combined.Ranges...)
+	tampered.Ranges[0].Records = append([]Record(nil), combined.Ranges[0].Records...)
+	tampered.Ranges[0].Records[1].Event.Payload = []byte("forged")
+	if err := VerifyCombinedRangeProof(summaries, tampered); err == nil {
+		t.Fatal("tampered alpha range must fail")
+	} else {
+		assertTamper(t, err, TamperRewrite, 2)
+	}
+
+	swapped := *combined
+	swapped.Ranges = append([]RangeProof(nil), combined.Ranges...)
+	swapped.Ranges[0], swapped.Ranges[1] = swapped.Ranges[1], swapped.Ranges[0]
+	if err := VerifyCombinedRangeProof(summaries, swapped); err != nil {
+		t.Fatalf("range order inside the bundle is not a global order and must not matter: %v", err)
+	}
+
+	if err := VerifyCombinedRangeProof([]SealSummary{*alphaSeal}, *combined); err == nil {
+		t.Fatal("missing beta summary must fail")
+	} else {
+		assertTamper(t, err, TamperWrongSource, 0)
+	}
+	if err := VerifyCombinedRangeProof(summaries, CombinedRangeProof{Version: 2}); err == nil {
+		t.Fatal("empty combined proof must fail")
+	} else {
+		assertTamper(t, err, TamperMissingRange, 0)
+	}
+	if _, err := store.BuildCombinedRangeProof(summaries, nil); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("empty request list must be refused, got %v", err)
+	}
+	if _, err := store.BuildCombinedRangeProof(summaries, []SourceRangeRequest{{Source: "alpha", StartSeq: 0, EndSeq: 1}}); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("empty range must be refused, got %v", err)
+	}
+}
