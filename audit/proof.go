@@ -23,7 +23,10 @@ type RangeProof struct {
 // needed to anchor them in the externally retained sealed Merkle root.
 func (s *Store) BuildRangeProof(source string, startSeq, endSeq uint64) (*RangeProof, error) {
 	state := s.sources[source]
-	if state == nil || startSeq == 0 || endSeq < startSeq {
+	if startSeq == 0 || endSeq < startSeq {
+		return nil, fmt.Errorf("%w: empty range", ErrInvalidRange)
+	}
+	if state == nil {
 		return nil, ErrInvalidRange
 	}
 	if endSeq > uint64(len(state.records)) {
@@ -65,8 +68,11 @@ func VerifyRangeProof(summary SealSummary, proof RangeProof) error {
 	if proof.Version != 2 || proof.Source != summary.Source || proof.SealedCount != summary.RecordCount {
 		return &TamperError{Kind: TamperWrongSource, Message: "range proof does not match the external seal summary"}
 	}
-	if proof.StartSeq == 0 || proof.EndSeq < proof.StartSeq || proof.EndSeq > proof.SealedCount {
-		return &TamperError{Kind: TamperMissingRange, Message: "requested range is outside the sealed segment"}
+	if proof.StartSeq == 0 || proof.EndSeq < proof.StartSeq {
+		return &TamperError{Kind: TamperMissingRange, Message: "requested range is empty"}
+	}
+	if proof.EndSeq > proof.SealedCount {
+		return &TamperError{Kind: TamperMissingRange, RecordSeq: proof.SealedCount + 1, Message: "requested range extends past the sealed segment boundary"}
 	}
 	if len(proof.Records) != int(proof.EndSeq-proof.StartSeq+1) || len(proof.MerkleSteps) != len(proof.Records) {
 		return &TamperError{Kind: TamperMissingRange, RecordSeq: proof.StartSeq, Message: "range proof omits a required sequence number"}
