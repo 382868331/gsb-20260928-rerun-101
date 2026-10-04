@@ -373,3 +373,177 @@ func TestRegistryOfflineNoticeTimeBasis(t *testing.T) {
 		t.Fatalf("delivered material must not pretend to disappear, got %d deliveries", got)
 	}
 }
+
+func TestRegistrySupplementaryGrantKeepsOriginalBinding(t *testing.T) {
+	summary, parent := setupReDisclosure(t)
+	auth := onwardAuth(summary)
+	authID := AuthorizationID(auth)
+	reg := NewRegistry()
+
+	t1 := reBase.Add(time.Hour)
+	t2 := reBase.Add(2 * time.Hour)
+	t3 := reBase.Add(3 * time.Hour)
+	t4 := reBase.Add(4 * time.Hour)
+
+	importGrant := func(id string, a Authorization, at time.Time) {
+		t.Helper()
+		added, err := reg.ImportNotice(Notice{
+			ID:              id,
+			Kind:            NoticeGrant,
+			AuthorizationID: authID,
+			EffectiveAt:     at,
+			Authorization:   &a,
+		}, at)
+		if err != nil || !added {
+			t.Fatalf("import %s: added=%v err=%v", id, added, err)
+		}
+	}
+
+	importGrant("g1", auth, t1)
+	rd, err := DeriveReDisclosure(summary, parent, auth, "carol", 3, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.RecordDelivery(*rd, "bob", t1.Add(30*time.Minute)); err != nil {
+		t.Fatalf("delivery within original scope: %v", err)
+	}
+
+	// A legitimate supplementary grant for the SAME seal, source, and
+	// recipient enlarges the window in effect order.
+	widened := auth
+	widened.StartSeq = 1
+	widened.EndSeq = 8
+	importGrant("g2-widen", widened, t2)
+	scope, err := reg.EffectiveScopeAt(authID, t2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.StartSeq != 1 || scope.EndSeq != 8 {
+		t.Fatalf("legitimate supplement must widen scope, got %+v", scope)
+	}
+
+	// Supplementary grants for a different seal or source, or addressed to a
+	// different recipient, must all be refused even though they reuse the
+	// same authorization ID.
+	wrongSeal := widened
+	wrongSeal.SealID = "some-other-seal"
+	wrongSource := widened
+	wrongSource.Source = "camera-b"
+	wrongRecipient := widened
+	wrongRecipient.Recipient = "mallory"
+	for name, foreign := range map[string]Authorization{
+		"seal":      wrongSeal,
+		"source":    wrongSource,
+		"recipient": wrongRecipient,
+	} {
+		foreign := foreign
+		added, err := reg.ImportNotice(Notice{
+			ID:              "foreign-" + name,
+			Kind:            NoticeGrant,
+			AuthorizationID: authID,
+			EffectiveAt:     t2,
+			Authorization:   &foreign,
+		}, t2)
+		if err == nil || !errors.Is(err, ErrBeyondAuthorization) {
+			t.Fatalf("cross-%s grant must be refused: added=%v err=%v", name, added, err)
+		}
+		if added {
+			t.Fatalf("cross-%s grant must not be recorded", name)
+		}
+	}
+
+	// A rejected notice changes nothing: the widened scope, revocation state
+	// and delivery history all stay exactly as they were.
+	scope, err = reg.EffectiveScopeAt(authID, t2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Revoked || scope.StartSeq != 1 || scope.EndSeq != 8 {
+		t.Fatalf("rejected foreign grants must not change scope, got %+v", scope)
+	}
+	if got := len(reg.Deliveries(authID)); got != 1 {
+		t.Fatalf("rejected foreign grants must not touch deliveries, got %d", got)
+	}
+
+	// Legitimate narrowing and revocation still take effect in order.
+	narrow := Notice{
+		ID:              "n1",
+		Kind:            NoticeNarrow,
+		AuthorizationID: authID,
+		EffectiveAt:     t3,
+		Narrow:          &NarrowSpec{StartSeq: 2, EndSeq: 6, AllowOnward: true},
+	}
+	if _, err := reg.ImportNotice(narrow, t3); err != nil {
+		t.Fatalf("legitimate narrow: %v", err)
+	}
+	scope, err = reg.EffectiveScopeAt(authID, t3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.StartSeq != 2 || scope.EndSeq != 6 {
+		t.Fatalf("narrowed scope = %+v, want 2-6", scope)
+	}
+	revoke := Notice{ID: "r1", Kind: NoticeRevoke, AuthorizationID: authID, EffectiveAt: t4}
+	if _, err := reg.ImportNotice(revoke, t4); err != nil {
+		t.Fatalf("legitimate revoke: %v", err)
+	}
+	scope, err = reg.EffectiveScopeAt(authID, t4)
+	if err != nil || !scope.Revoked {
+		t.Fatalf("scope at t4 = %+v, err=%v, want revoked", scope, err)
+	}
+
+	// Even after revocation, foreign supplementary grants stay rejected and
+	// cannot resurrect or rebind the authorization.
+	foreign := wrongSeal
+	foreign.ID = "foreign-revived"
+	if added, err := reg.ImportNotice(Notice{
+		ID:              "foreign-after-revoke",
+		Kind:            NoticeGrant,
+		AuthorizationID: authID,
+		EffectiveAt:     t4,
+		Authorization:   &foreign,
+	}, t4); err == nil || added {
+		t.Fatalf("foreign grant after revocation must be refused: added=%v err=%v", added, err)
+	}
+
+	// Save and reopen: the binding survives, legal timeline is intact, and
+	// none of the refused grants gained any effect.
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := reg.SaveRegistry(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err = loaded.EffectiveScopeAt(authID, t2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.StartSeq != 1 || scope.EndSeq != 8 {
+		t.Fatalf("reloaded widened scope = %+v, want 1-8", scope)
+	}
+	scope, err = loaded.EffectiveScopeAt(authID, t3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.StartSeq != 2 || scope.EndSeq != 6 {
+		t.Fatalf("reloaded narrowed scope = %+v, want 2-6", scope)
+	}
+	scope, err = loaded.EffectiveScopeAt(authID, t4)
+	if err != nil || !scope.Revoked {
+		t.Fatalf("reloaded scope at t4 = %+v, err=%v, want revoked", scope, err)
+	}
+	if got := len(loaded.Deliveries(authID)); got != 1 {
+		t.Fatalf("reloaded registry must keep the historical delivery, got %d", got)
+	}
+	if added, err := loaded.ImportNotice(Notice{
+		ID:              "foreign-after-load",
+		Kind:            NoticeGrant,
+		AuthorizationID: authID,
+		EffectiveAt:     t4,
+		Authorization:   &wrongSource,
+	}, t4); err == nil || added {
+		t.Fatalf("reopened registry must still refuse cross-source grant: added=%v err=%v", added, err)
+	}
+}

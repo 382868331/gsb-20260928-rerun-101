@@ -97,15 +97,27 @@ type VerificationRecord struct {
 type Registry struct {
 	notices       []Notice
 	noticeIDs     map[string]struct{}
+	bindings      map[string]authBinding
 	deliveries    []Delivery
 	deliveryIDs   map[string]struct{}
 	verifications []VerificationRecord
+}
+
+// authBinding records the seal, source, and recipient an authorization ID
+// was established for. Supplementary notices for the same authorization ID
+// must stay within that binding; the same ID can never be re-pointed at a
+// different seal, source, or recipient.
+type authBinding struct {
+	SealID    string `json:"seal_id"`
+	Source    string `json:"source"`
+	Recipient string `json:"recipient"`
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		noticeIDs:   make(map[string]struct{}),
+		bindings:    make(map[string]authBinding),
 		deliveryIDs: make(map[string]struct{}),
 	}
 }
@@ -139,10 +151,32 @@ func (r *Registry) ImportNotice(n Notice, recordedAt time.Time) (bool, error) {
 	if _, seen := r.noticeIDs[n.ID]; seen {
 		return false, nil
 	}
+	if n.Kind == NoticeGrant {
+		b := authBinding{
+			SealID:    n.Authorization.SealID,
+			Source:    n.Authorization.Source,
+			Recipient: n.Authorization.Recipient,
+		}
+		if existing, ok := r.bindings[n.AuthorizationID]; ok && existing != b {
+			return false, fmt.Errorf(
+				"%w: authorization %q is bound to seal %q source %q recipient %q, refusing grant for seal %q source %q recipient %q",
+				ErrBeyondAuthorization, n.AuthorizationID,
+				existing.SealID, existing.Source, existing.Recipient,
+				b.SealID, b.Source, b.Recipient,
+			)
+		}
+	}
 	n.RecordedAt = recordedAt.UTC()
 	n.EffectiveAt = n.EffectiveAt.UTC()
 	r.notices = append(r.notices, n)
 	r.noticeIDs[n.ID] = struct{}{}
+	if n.Kind == NoticeGrant {
+		r.bindings[n.AuthorizationID] = authBinding{
+			SealID:    n.Authorization.SealID,
+			Source:    n.Authorization.Source,
+			Recipient: n.Authorization.Recipient,
+		}
+	}
 	return true, nil
 }
 
@@ -161,11 +195,23 @@ func (r *Registry) EffectiveScopeAt(authorizationID string, basis time.Time) (Sc
 	sort.SliceStable(relevant, func(i, j int) bool {
 		return relevant[i].EffectiveAt.Before(relevant[j].EffectiveAt)
 	})
+	binding, bound := r.bindings[authorizationID]
 	var scope Scope
 	known := false
 	for _, n := range relevant {
 		switch n.Kind {
 		case NoticeGrant:
+			// A grant notice that does not match the authorization's original
+			// binding can never widen it. ImportNotice rejects such notices,
+			// but records persisted by older builds are ignored here as well so
+			// reopening a registry stays consistent.
+			if bound && (authBinding{
+				SealID:    n.Authorization.SealID,
+				Source:    n.Authorization.Source,
+				Recipient: n.Authorization.Recipient,
+			} != binding) {
+				continue
+			}
 			a := n.Authorization
 			if !known || scope.Revoked {
 				scope = Scope{
@@ -374,6 +420,20 @@ func LoadRegistry(path string) (*Registry, error) {
 	for _, n := range file.Notices {
 		if _, seen := r.noticeIDs[n.ID]; seen {
 			continue
+		}
+		if n.Kind == NoticeGrant && n.Authorization != nil {
+			b := authBinding{
+				SealID:    n.Authorization.SealID,
+				Source:    n.Authorization.Source,
+				Recipient: n.Authorization.Recipient,
+			}
+			if existing, ok := r.bindings[n.AuthorizationID]; ok && existing != b {
+				// A grant that would re-bind the authorization to a different
+				// seal, source, or recipient is never replayed into scope
+				// computation; the original binding wins.
+				continue
+			}
+			r.bindings[n.AuthorizationID] = b
 		}
 		r.notices = append(r.notices, n)
 		r.noticeIDs[n.ID] = struct{}{}
