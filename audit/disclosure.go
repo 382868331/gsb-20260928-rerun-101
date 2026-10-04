@@ -36,6 +36,7 @@ func (e *DisclosureConflictError) Error() string {
 type Disclosure struct {
 	Version       uint64              `json:"version"`
 	SealID        string              `json:"seal_id"`
+	AuthID        string              `json:"auth_id,omitempty"`
 	Source        string              `json:"source"`
 	Recipient     string              `json:"recipient"`
 	StartSeq      uint64              `json:"start_seq"`
@@ -151,7 +152,7 @@ func VerifyDisclosure(summary SealSummary, d Disclosure) error {
 // returned so the caller keeps both materials on file.
 func MergeDisclosures(a, b Disclosure) (*Disclosure, error) {
 	if a.SealID == "" || a.SealID != b.SealID || a.Source != b.Source || a.Recipient != b.Recipient ||
-		a.SealedCount != b.SealedCount || a.Version != b.Version {
+		a.SealedCount != b.SealedCount || a.Version != b.Version || a.AuthID != b.AuthID {
 		return nil, ErrDisclosureMismatch
 	}
 	lo, hi := a, b
@@ -169,6 +170,7 @@ func MergeDisclosures(a, b Disclosure) (*Disclosure, error) {
 	merged := &Disclosure{
 		Version:     lo.Version,
 		SealID:      lo.SealID,
+		AuthID:      lo.AuthID,
 		Source:      lo.Source,
 		Recipient:   lo.Recipient,
 		StartSeq:    lo.StartSeq,
