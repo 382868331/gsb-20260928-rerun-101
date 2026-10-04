@@ -13,7 +13,7 @@
 - `MergeDisclosures`：只合并同一封存（`SealID` 相同）、同一来源、同一接收者且区间相邻或重叠的披露；重叠记录去重只计一次，重叠内容矛盾时返回 `DisclosureConflictError`，双方材料都保留、拒绝合并。来源名称相同但封存不同或接收者不同的材料一律拒绝混合。
 - `DeriveReDisclosure` / `VerifyReDisclosure`：接收者在明确授权（`Authorization`）下把获准范围中的一部分转交给新接收者。授权限定来源、序号区间、可见事件类型与是否允许继续转交；再披露材料通过 `SealID` 与 `AuthorizationID` 标明继承的封存与授权。来源名称相同或持有者另有更大范围的材料，都不能扩大本次披露；窗口外记录不可见也不会被误报缺失，错误只指序号、不回放内容。
 - `MergeReDisclosures`：只合并同一封存、同一授权、同一来源、同一接收者且区间相邻或重叠的再披露；不同授权下看似相同的材料拒绝合并，重叠内容矛盾时返回 `DisclosureConflictError`。
-- `Registry`：登记授权补充（`NoticeGrant`）、收窄（`NoticeNarrow`）与撤回（`NoticeRevoke`）通知，按 `EffectiveAt` 时间依据计算有效范围；`RecordDelivery` 按交付当时的有效范围核验并留存实际交付记录，过去的交付不因后来的收窄或撤回而消失；`RecordVerification` 保留旧时间依据下的核验记录。重复导入同一通知或同一交付不增加权限；`SaveRegistry` / `LoadRegistry` 持久化后，每次转交仍可追到当时的有效授权与实际公开范围。
+- `Registry`：登记授权补充（`NoticeGrant`）、收窄（`NoticeNarrow`）与撤回（`NoticeRevoke`）通知，按 `EffectiveAt` 时间依据计算有效范围；同一授权编号一经登记即绑定其 seal、source 与接收方，指向其他封存对象、来源或接收方的补充通知一律拒绝且不影响已有范围、撤销状态与交付记录；`RecordDelivery` 按交付当时的有效范围核验并留存实际交付记录，过去的交付不因后来的收窄或撤回而消失；`RecordVerification` 保留旧时间依据下的核验记录。重复导入同一通知或同一交付不增加权限；`SaveRegistry` / `LoadRegistry` 持久化后，每次转交仍可追到当时的有效授权与实际公开范围。
 - `VerifySealedFile`：用外部封存摘要校验任意副本，识别改写、插入、中间删除、完整尾部删除和整段替换。
 - `Open`：写入中断后只截掉物理尾部最后一条不完整帧，恢复到最后一条完整且校验通过的记录。
 - `Query`：按追加/来源顺序返回记录。

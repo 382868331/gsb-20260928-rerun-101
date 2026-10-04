@@ -373,3 +373,150 @@ func TestRegistryOfflineNoticeTimeBasis(t *testing.T) {
 		t.Fatalf("delivered material must not pretend to disappear, got %d deliveries", got)
 	}
 }
+
+func TestRegistryRejectsCrossSealSourceSupplements(t *testing.T) {
+	summary, parent := setupReDisclosure(t)
+	auth := onwardAuth(summary)
+	authID := AuthorizationID(auth)
+	reg := NewRegistry()
+
+	t1 := reBase.Add(time.Hour)
+	t2 := reBase.Add(2 * time.Hour)
+
+	if _, err := reg.ImportNotice(Notice{
+		ID:              "g1",
+		Kind:            NoticeGrant,
+		AuthorizationID: authID,
+		EffectiveAt:     t1,
+		Authorization:   &auth,
+	}, t1); err != nil {
+		t.Fatal(err)
+	}
+	rd, err := DeriveReDisclosure(summary, parent, auth, "carol", 3, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.RecordDelivery(*rd, "bob", t1.Add(30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(a *Authorization)
+	}{
+		{"different seal", func(a *Authorization) { a.SealID = "seal-other" }},
+		{"different source", func(a *Authorization) { a.Source = "camera-b" }},
+		{"different recipient", func(a *Authorization) { a.Recipient = "mallory" }},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			foreign := auth
+			tc.mutate(&foreign)
+			foreign.StartSeq = 1
+			foreign.EndSeq = 8
+			added, err := reg.ImportNotice(Notice{
+				ID:              "foreign-" + tc.name,
+				Kind:            NoticeGrant,
+				AuthorizationID: authID,
+				EffectiveAt:     t2,
+				Authorization:   &foreign,
+			}, t2)
+			if !errors.Is(err, ErrAuthorizationBindingMismatch) {
+				t.Fatalf("case %d: expected binding mismatch, got added=%v err=%v", i, added, err)
+			}
+			if added {
+				t.Fatalf("case %d: mismatched notice must not be imported", i)
+			}
+		})
+	}
+
+	// The established scope, deliveries, and non-revoked status are
+	// untouched by the rejected supplements.
+	scope, err := reg.EffectiveScopeAt(authID, t2.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Revoked || scope.StartSeq != 2 || scope.EndSeq != 7 {
+		t.Fatalf("rejected supplements must not change the scope, got %+v", scope)
+	}
+	deliveries := reg.Deliveries(authID)
+	if len(deliveries) != 1 || deliveries[0].StartSeq != 3 || deliveries[0].EndSeq != 5 {
+		t.Fatalf("rejected supplements must not change deliveries, got %+v", deliveries)
+	}
+
+	// A legitimate supplement under the same binding still widens the
+	// scope, and narrowing plus revocation still apply in order.
+	wider := auth
+	wider.StartSeq = 1
+	wider.EndSeq = 8
+	if _, err := reg.ImportNotice(Notice{
+		ID:              "g2",
+		Kind:            NoticeGrant,
+		AuthorizationID: authID,
+		EffectiveAt:     t2,
+		Authorization:   &wider,
+	}, t2); err != nil {
+		t.Fatalf("same-binding supplement must be accepted: %v", err)
+	}
+	t3 := reBase.Add(3 * time.Hour)
+	if _, err := reg.ImportNotice(Notice{
+		ID:              "n2",
+		Kind:            NoticeNarrow,
+		AuthorizationID: authID,
+		EffectiveAt:     t3,
+		Narrow:          &NarrowSpec{StartSeq: 2, EndSeq: 6, AllowOnward: true},
+	}, t3); err != nil {
+		t.Fatal(err)
+	}
+	t4 := reBase.Add(4 * time.Hour)
+	if _, err := reg.ImportNotice(Notice{
+		ID:              "r1",
+		Kind:            NoticeRevoke,
+		AuthorizationID: authID,
+		EffectiveAt:     t4,
+	}, t4); err != nil {
+		t.Fatal(err)
+	}
+	scope, err = reg.EffectiveScopeAt(authID, t3.Add(30*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.Revoked || scope.StartSeq != 2 || scope.EndSeq != 6 {
+		t.Fatalf("narrowed scope = %+v, want 2-6", scope)
+	}
+	scope, err = reg.EffectiveScopeAt(authID, t4.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scope.Revoked {
+		t.Fatalf("scope after revocation = %+v, want revoked", scope)
+	}
+
+	// Persistence keeps the binding enforcement after a reload.
+	path := filepath.Join(t.TempDir(), "registry.json")
+	if err := reg.SaveRegistry(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadRegistry(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := auth
+	foreign.Source = "camera-b"
+	if _, err := loaded.ImportNotice(Notice{
+		ID:              "foreign-after-reload",
+		Kind:            NoticeGrant,
+		AuthorizationID: authID,
+		EffectiveAt:     t4.Add(time.Hour),
+		Authorization:   &foreign,
+	}, t4.Add(time.Hour)); !errors.Is(err, ErrAuthorizationBindingMismatch) {
+		t.Fatalf("reloaded registry must still reject cross-source supplements: %v", err)
+	}
+	scope, err = loaded.EffectiveScopeAt(authID, t4.Add(time.Minute))
+	if err != nil || !scope.Revoked {
+		t.Fatalf("reloaded scope = %+v, err=%v, want revoked", scope, err)
+	}
+	if got := len(loaded.Deliveries(authID)); got != 1 {
+		t.Fatalf("reloaded deliveries changed, got %d", got)
+	}
+}

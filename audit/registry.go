@@ -17,6 +17,11 @@ var ErrUnknownAuthorization = errors.New("unknown authorization")
 // effective scope is withdrawn at the requested time basis.
 var ErrRevoked = errors.New("authorization is revoked at this time basis")
 
+// ErrAuthorizationBindingMismatch reports a supplementary notice that
+// reuses an authorization ID already bound to a different seal, source,
+// or recipient. Such notices are rejected and change nothing.
+var ErrAuthorizationBindingMismatch = errors.New("authorization notice does not match the established seal, source, and recipient")
+
 // NoticeKind classifies how a notice changes an authorization's effective
 // scope over time.
 type NoticeKind string
@@ -128,6 +133,9 @@ func (r *Registry) ImportNotice(n Notice, recordedAt time.Time) (bool, error) {
 		if err := validateAuthorization(*n.Authorization); err != nil {
 			return false, err
 		}
+		if err := r.checkAuthorizationBinding(n.AuthorizationID, *n.Authorization); err != nil {
+			return false, err
+		}
 	case NoticeNarrow:
 		if n.Narrow == nil || n.Narrow.StartSeq == 0 || n.Narrow.EndSeq < n.Narrow.StartSeq {
 			return false, fmt.Errorf("%w: narrow notice range is empty", ErrInvalidRange)
@@ -144,6 +152,25 @@ func (r *Registry) ImportNotice(n Notice, recordedAt time.Time) (bool, error) {
 	r.notices = append(r.notices, n)
 	r.noticeIDs[n.ID] = struct{}{}
 	return true, nil
+}
+
+// checkAuthorizationBinding ensures a grant notice for an authorization ID
+// that already has a grant on record names the same seal, source, and
+// recipient. A supplementary grant pointing at a different seal, source,
+// or recipient is refused so it can never widen, shift, or revoke the
+// established scope.
+func (r *Registry) checkAuthorizationBinding(authorizationID string, a Authorization) error {
+	for _, existing := range r.notices {
+		if existing.Kind != NoticeGrant || existing.AuthorizationID != authorizationID || existing.Authorization == nil {
+			continue
+		}
+		bound := existing.Authorization
+		if bound.SealID != a.SealID || bound.Source != a.Source || bound.Recipient != a.Recipient {
+			return fmt.Errorf("%w: authorization %s is bound to seal %s source %s recipient %s",
+				ErrAuthorizationBindingMismatch, authorizationID, bound.SealID, bound.Source, bound.Recipient)
+		}
+	}
+	return nil
 }
 
 // EffectiveScopeAt computes the scope of one authorization under the given
@@ -374,6 +401,11 @@ func LoadRegistry(path string) (*Registry, error) {
 	for _, n := range file.Notices {
 		if _, seen := r.noticeIDs[n.ID]; seen {
 			continue
+		}
+		if n.Kind == NoticeGrant && n.Authorization != nil {
+			if err := r.checkAuthorizationBinding(n.AuthorizationID, *n.Authorization); err != nil {
+				return nil, err
+			}
 		}
 		r.notices = append(r.notices, n)
 		r.noticeIDs[n.ID] = struct{}{}
