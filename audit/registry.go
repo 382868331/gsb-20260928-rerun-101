@@ -101,6 +101,9 @@ type Registry struct {
 	deliveries    []Delivery
 	deliveryIDs   map[string]struct{}
 	verifications []VerificationRecord
+	decisions     []BatchDecision
+	decisionIDs   map[string]int
+	withdrawn     map[string]struct{}
 }
 
 // authBinding records the seal, source, and recipient an authorization ID
@@ -119,6 +122,8 @@ func NewRegistry() *Registry {
 		noticeIDs:   make(map[string]struct{}),
 		bindings:    make(map[string]authBinding),
 		deliveryIDs: make(map[string]struct{}),
+		decisionIDs: make(map[string]int),
+		withdrawn:   make(map[string]struct{}),
 	}
 }
 
@@ -126,27 +131,11 @@ func NewRegistry() *Registry {
 // known ID is a no-op and never adds permission. The notice is stamped
 // with RecordedAt so offline recipients show when they learned of it.
 func (r *Registry) ImportNotice(n Notice, recordedAt time.Time) (bool, error) {
-	if n.ID == "" {
-		return false, errors.New("notice ID is required")
+	if _, w := r.withdrawn[n.ID]; w {
+		return false, fmt.Errorf("%w: %q", ErrNoticeWithdrawn, n.ID)
 	}
-	if n.AuthorizationID == "" {
-		return false, errors.New("notice must name an authorization")
-	}
-	switch n.Kind {
-	case NoticeGrant:
-		if n.Authorization == nil {
-			return false, errors.New("grant notice must carry the authorization")
-		}
-		if err := validateAuthorization(*n.Authorization); err != nil {
-			return false, err
-		}
-	case NoticeNarrow:
-		if n.Narrow == nil || n.Narrow.StartSeq == 0 || n.Narrow.EndSeq < n.Narrow.StartSeq {
-			return false, fmt.Errorf("%w: narrow notice range is empty", ErrInvalidRange)
-		}
-	case NoticeRevoke:
-	default:
-		return false, fmt.Errorf("unknown notice kind %q", n.Kind)
+	if err := validateNotice(n); err != nil {
+		return false, err
 	}
 	if _, seen := r.noticeIDs[n.ID]; seen {
 		return false, nil
@@ -389,6 +378,8 @@ type registryFile struct {
 	Notices       []Notice             `json:"notices"`
 	Deliveries    []Delivery           `json:"deliveries"`
 	Verifications []VerificationRecord `json:"verifications"`
+	Decisions     []BatchDecision      `json:"decisions,omitempty"`
+	Withdrawn     []string             `json:"withdrawn,omitempty"`
 }
 
 // SaveRegistry persists the registry so that, after a restart, every
@@ -399,6 +390,8 @@ func (r *Registry) SaveRegistry(path string) error {
 		Notices:       r.notices,
 		Deliveries:    r.deliveries,
 		Verifications: r.verifications,
+		Decisions:     r.decisions,
+		Withdrawn:     sortedKeys(r.withdrawn),
 	}, "", "  ")
 	if err != nil {
 		return err
@@ -447,5 +440,24 @@ func LoadRegistry(path string) (*Registry, error) {
 		r.deliveryIDs[key] = struct{}{}
 	}
 	r.verifications = append(r.verifications, file.Verifications...)
+	for _, d := range file.Decisions {
+		if _, seen := r.decisionIDs[d.ID]; seen {
+			continue
+		}
+		r.decisions = append(r.decisions, d)
+		r.decisionIDs[d.ID] = len(r.decisions) - 1
+	}
+	for _, id := range file.Withdrawn {
+		r.withdrawn[id] = struct{}{}
+	}
 	return r, nil
+}
+
+func sortedKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
